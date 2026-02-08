@@ -22,10 +22,6 @@ from models_db import User, Analysis
 from auth import hash_password, verify_password, create_access_token
 
 
-# -------------------------------
-# App
-# -------------------------------
-
 app = FastAPI()
 
 app.add_middleware(
@@ -37,16 +33,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# -------------------------------
-# DB init
-# -------------------------------
 
 Base.metadata.create_all(bind=engine)
 
-
-# -------------------------------
-# DB dependency
-# -------------------------------
 
 def get_db():
     db = SessionLocal()
@@ -55,10 +44,6 @@ def get_db():
     finally:
         db.close()
 
-
-# -------------------------------
-# JWT dependency
-# -------------------------------
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
@@ -84,10 +69,6 @@ def get_current_user(
     return user
 
 
-# -------------------------------
-# Human face gate (FAST filter)
-# -------------------------------
-
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
@@ -101,8 +82,17 @@ def contains_human_face(pil_image):
 
 
 # -------------------------------
-# CNN loader (condition models)
+# FIX : function must be BEFORE use
 # -------------------------------
+
+def looks_like_signature_or_blank(pil_image):
+    img = np.array(pil_image)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, th = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    foreground_ratio = np.count_nonzero(th) / th.size
+    return foreground_ratio < 0.05
+
 
 def load_cnn_model(path):
     model = models.resnet18(weights=None)
@@ -120,10 +110,6 @@ cnn_models = {
 condition_classes = ["Good", "Average", "Bad"]
 
 
-# -------------------------------
-# Product type classifier
-# -------------------------------
-
 type_model = models.resnet18(weights=None)
 type_model.fc = nn.Linear(type_model.fc.in_features, 2)
 type_model.load_state_dict(torch.load("models/type_model.pt", map_location="cpu"))
@@ -132,17 +118,9 @@ type_model.eval()
 type_classes = ["laptop", "mobile"]
 
 
-# -------------------------------
-# Phase-2 & Phase-3 models
-# -------------------------------
-
 lifecycle_model = joblib.load("lifecycle_model.pkl")
 pricing_model   = joblib.load("pricing_model.pkl")
 
-
-# -------------------------------
-# Image preprocessing
-# -------------------------------
 
 img_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -153,18 +131,10 @@ img_transform = transforms.Compose([
 ])
 
 
-# -------------------------------
-# Health
-# -------------------------------
-
 @app.get("/")
 def home():
     return {"status": "Circular Economy AI backend running"}
 
-
-# =========================================================
-# AUTH
-# =========================================================
 
 @app.post("/auth/register")
 def register(email: str, password: str, db: Session = Depends(get_db)):
@@ -199,10 +169,6 @@ def login(
     return {"access_token": token, "token_type": "bearer"}
 
 
-# =========================================================
-# OLD decision API
-# =========================================================
-
 @app.post("/decision")
 def get_decision(
     condition_score: float,
@@ -231,10 +197,6 @@ def get_decision(
     }
 
 
-# =========================================================
-# MAIN AI PIPELINE
-# =========================================================
-
 @app.post("/analyze-product")
 async def analyze_product(
     image: UploadFile = File(...),
@@ -248,24 +210,14 @@ async def analyze_product(
     user: User = Depends(get_current_user)
 ):
 
-    # -------------------------
-    # Read image
-    # -------------------------
-
     contents = await image.read()
 
-    # size limit (optional but ok)
-    if len(contents) > 1_000_000:
+    if len(contents) > 600_000:
         raise HTTPException(status_code=400, detail="Image too large")
 
-    # IMPORTANT: reset pointer (safety for future use)
     image.file.seek(0)
 
     img = Image.open(io.BytesIO(contents)).convert("RGB")
-
-    # -------------------------
-    # HUMAN IMAGE REJECTION
-    # -------------------------
 
     if contains_human_face(img):
         raise HTTPException(
@@ -275,9 +227,6 @@ async def analyze_product(
                 "message": "Please upload only a product image (laptop or mobile)."
             }
         )
-    # ---------------------------------
-# Signature / blank image rejection
-# ---------------------------------
 
     if looks_like_signature_or_blank(img):
         raise HTTPException(
@@ -288,27 +237,7 @@ async def analyze_product(
             }
         )
 
-    def looks_like_signature_or_blank(pil_image):
-        img = np.array(pil_image)
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-        # normalize
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-        # binary image (separate ink from background)
-        _, th = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-
-        # percentage of foreground pixels
-        foreground_ratio = np.count_nonzero(th) / th.size
-
-        return foreground_ratio < 0.05
-
-
     img_tensor = img_transform(img).unsqueeze(0)
-
-    # -------------------------
-    # Phase 0 – product type
-    # -------------------------
 
     with torch.no_grad():
         type_out = type_model(img_tensor)
@@ -323,10 +252,6 @@ async def analyze_product(
     detected_category = type_classes[int(top2.indices[0])]
     category_confidence = best_prob
 
-    # -------------------------
-    # REJECTION GATE
-    # -------------------------
-
     if category_confidence < 0.75 or margin < 0.25:
         raise HTTPException(
             status_code=400,
@@ -338,10 +263,6 @@ async def analyze_product(
             }
         )
 
-    # -------------------------
-    # Phase 1 – condition
-    # -------------------------
-
     condition_model = cnn_models[detected_category]
 
     with torch.no_grad():
@@ -351,17 +272,9 @@ async def analyze_product(
     condition_score = float(probs.max().item())
     condition_class = condition_classes[int(probs.argmax().item())]
 
-    # -------------------------
-    # Phase 2 – lifecycle
-    # -------------------------
-
     X_life = np.array([[condition_score, age_months, usage_level]])
     remaining_life = float(lifecycle_model.predict(X_life)[0])
     remaining_life = max(0.0, remaining_life)
-
-    # -------------------------
-    # Phase 3 – pricing
-    # -------------------------
 
     X_price = np.array([[
         condition_score,
@@ -374,29 +287,17 @@ async def analyze_product(
     recommended_price = float(pricing_model.predict(X_price)[0])
     recommended_price = max(500.0, recommended_price)
 
-    # -------------------------
-    # Phase 4 – decision
-    # -------------------------
-
     decision = decide_action(
         condition_score,
         remaining_life,
         recommended_price
     )
 
-    # -------------------------
-    # Phase 5 – recommendation
-    # -------------------------
-
     places = recommend_places(
         decision["action"],
         lat,
         lon
     )
-
-    # -------------------------
-    # Save history
-    # -------------------------
 
     record = Analysis(
         user_id=user.id,
@@ -410,10 +311,6 @@ async def analyze_product(
 
     db.add(record)
     db.commit()
-
-    # -------------------------
-    # Response
-    # -------------------------
 
     return {
         "detected_category": detected_category,
@@ -430,10 +327,6 @@ async def analyze_product(
         "recommended_places": places
     }
 
-
-# =========================================================
-# USER HISTORY
-# =========================================================
 
 @app.get("/me/history")
 def my_history(
