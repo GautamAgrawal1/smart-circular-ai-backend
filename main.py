@@ -253,6 +253,14 @@ async def analyze_product(
     # -------------------------
 
     contents = await image.read()
+
+    # size limit (optional but ok)
+    if len(contents) > 1_000_000:
+        raise HTTPException(status_code=400, detail="Image too large")
+
+    # IMPORTANT: reset pointer (safety for future use)
+    image.file.seek(0)
+
     img = Image.open(io.BytesIO(contents)).convert("RGB")
 
     # -------------------------
